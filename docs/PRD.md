@@ -2,8 +2,8 @@
 
 | 項目 | 說明 |
 |------|------|
-| 版本 | 0.2 |
-| 更新日期 | 2026-03-10 |
+| 版本 | 0.3 |
+| 更新日期 | 2026-03-11 |
 | 參考 | [Threads API Rate Limit](Threads_API_rate_limit.md) |
 
 ---
@@ -31,9 +31,9 @@
 | **客戶 (tenant)** | 使用下載服務的一方，有唯一識別（如 `client_id`），擁有獨立的帳號清單、token、下載結果與進度。 |
 | **帳號 (account)** | 欲追蹤的公開 Threads 帳號，以 **username** 識別。 |
 | **Token** | 用於呼叫 Threads API（如 profile_posts）的授權憑證；每客戶可授權一到多個，不跨客戶共享；限額以單一 token 計算。 |
-| **下載區間 / 涵蓋範圍** | 每個「客戶 + 帳號」已下載的貼文時間或 ID 區間（如 last_cursor、latest_downloaded_at、oldest_downloaded_at）。 |
-| **Cursor** | API 分頁用游標，用於記錄下次從何處續抓貼文。 |
-
+| **下載區間 / 涵蓋範圍** | 每個「客戶 + 帳號」已下載的貼文時間或 ID 區間（latest_downloaded_at、oldest_downloaded_at）。 |
+| **Cursor** | API 分頁用游標，當API回應資料包含cursor時，需要繼續翻頁取得下一頁的資料。 |
+ 
 ---
 
 ## 三、使用者與多租戶
@@ -50,13 +50,16 @@
 
 ### 帳號清單
 
-- 由**另一套服務**維護（本 downloader 不維護「有興趣的 Threads 帳號清單」，但Downloader需要記錄每一個帳號下載的狀態, 像是downloaded_start_date, downloaded_end_date，若有需要可以在本地資料庫維護token清單snapshot）。
-- Downloader 取得每客戶的帳號清單方式二擇一或並存（依部署決定）：**直接存取該服務的 DB**，或**透過該服務的 API** 取得。
+- 由**另一套服務**進行管理（本Downloader需要記錄每一個帳號下載的狀態, 像是latest_downloaded_at、oldest_downloaded_at，需要建立DB table進行維護）。
+- Downloader **透過該服務的 API** 取得每客戶的帳號清單。
 
-### Token 與配額
+### Token 與配額 (Rate limits)
 
-- 每個客戶授權**一到多個** Threads API token（用於呼叫 profile_posts 等）；Token 僅供該客戶使用，**不跨客戶共享**，故**每客戶每日限額 = 1,000 × 該客戶持有之 token 數**。
-- **Token 管理**：由**另一套服務**負責（本 downloader 不實作 token 的發放、撤銷、儲存）。Downloader 透過**呼叫該服務的 API** 取得每個客戶當下授權的 token 清單，再據此進行排程與呼叫 Threads API (若有需要可以在本地資料庫維護token清單snapshot)。
+- 每個客戶授權**一到多個** Threads API token（用於呼叫 /profile_posts, /profile_lookup, /{threads-media-id} 等端點）；Token 僅供該客戶使用，**不跨客戶共享**。
+- 每個API端點有不同的限額，詳細可參考 Threads_API_rate_limit.md
+- 若端點有獨立的rate limit, 則**端點API呼叫每日總限額 = 端點rate limit × 該客戶持有之 token 數**。
+- 無論端點是否有獨立rate limit，所有的API呼叫都會被納入App層級總限額 **4800 x 該客戶持有之 token 數**
+- **Token 管理**：由**另一套服務**負責新增及refresh token（本 downloader 不實作 token 的發放、撤銷）。Downloader 透過**呼叫該服務的 API** 取得每個客戶當下授權的 token 清單，再據此進行排程與呼叫 Threads API (若有需要可以在本地資料庫維護token清單snapshot)。
 
 ### 可選補充
 
@@ -72,13 +75,12 @@
 
 ### 取得方式
 
-- Downloader 可能**直接存取帳號清單服務的 DB**，或**透過該服務的 API** 取得清單；實作時可支援其中一種或兩種並存（依部署/環境選擇）。
+- Downloader **透過該服務的 API** 取得清單，並且持久化到本地DB table本地DB table。
 
 ### 含義
 
-- **本系統儲存**：以「下載狀態、貼文資料」為主；帳號主檔不必然在本系統持久化，而是排程時向帳號清單服務（DB 或 API）查詢。
-- **排程**：在「每客戶 1,000 × token 數/日」的限額下，需**每客戶維度**的排程策略（見第六節）。
-- **可考慮**：從他服取得之清單的篩選（如僅啟用中帳號）、去重、帳號有效性檢查（profile_lookup 亦為每 token 1,000 次/日，需節制使用）。
+- **排程**：每個帳號每日需抓取一次發文（見第六節）。
+- **可考慮**：從帳號清單服取得之清單的篩選（如僅啟用中帳號）、去重、帳號有效性檢查（profile_lookup 亦為每 token 1,000 次/日，需節制使用）。
 
 ---
 
@@ -87,18 +89,17 @@
 ### 要記錄的內容（每帳號、每客戶）
 
 - **已下載時間或 ID 區間**：例如「最早已下載貼文時間」「最晚已下載貼文時間」或「最新/最舊 post_id 或 cursor」。
-- **游標／分頁**：若 API 支援 cursor-based 分頁，記錄每個帳號的 `next_cursor` 或等效狀態，以便下次從該處續抓。
 
 ### 首次 vs 增量
 
 - **首次**：全量抓取（從最新往回抓，直到 API 不給或到達指定的下載範圍起始時間）。
-- **增量**：定時只抓「新貼文」（自上次最晚時間或最新 cursor 之後）。
+- **增量**：定時只抓「新貼文」（自上次最晚時間）。
 
 ### 資料模型建議
 
 - **帳號識別**：以 **username** 為主（不依賴 profile_lookup 取得 threads-user-id，避免佔用同額度）。
 - **本系統持久化**：`Client`（或僅 client_id 參照）、`Post`（原始貼文資料）、`AccountDownloadState`（client_id, username, last_cursor, latest_downloaded_at, oldest_downloaded_at 等）。
-- **帳號清單**與**Token 清單**不於本系統維護：帳號清單由排程時向**帳號清單服務**取得（直接讀其 DB 或呼叫其 API），Token 清單由排程時透過**Token 管理服務 API** 取得。
+- 帳號清單由排程時向**帳號清單服務 API**取得，Token 清單由排程時透過**Token 管理服務 API** 取得，需持久化到Downloader的DB table需持久化到Downloader的DB table。
 
 ### 架構關係
 
@@ -133,7 +134,7 @@ flowchart LR
 
 - **輪詢**：在該客戶每日 (1,000 × token 數) 額度內，為其帳號清單排程；若帳號數超過額度，則多日輪完一輪（例如 1 個 token、10,000 帳號 ⇒ 約 10 天輪完一輪；3 個 token 則約 3,000/日，約 3～4 天）。
 - **優先順序**：依「上次抓取時間」或客戶自訂優先級，優先抓久未更新的帳號。
-- **Token 輪用**：若客戶有多個 token，可輪流使用以分散單一 token 的 1,000 次上限，並可記錄每 token 已用次數（若 API 有提供用量查詢可對齊）。
+- **Token 輪用**：若客戶有多個 token，可輪流使用以分散單一 token 的 1,000 次上限
 - **退避與錯誤**：遇到 429 或限流時延後重試、記錄失敗，避免浪費該 token 配額。
 
 ### 定時
@@ -146,11 +147,11 @@ flowchart LR
 
 ### 儲存
 
-- 貼文原始回應（JSON 或正規化表）、下載時間、來源帳號、client_id；若需去重，可依 post id 做唯一約束。
+- 將貼文原始回應（JSON）、下載時間、來源帳號、client_id以jsonl方式進行儲存
 
 ### 輸出
 
-- 是否要匯出（CSV/JSON/DB dump）、是否要 Webhook 或通知「新貼文」，可列為進階或 Phase 2（見產品決策區）。
+- 將所有抓取的貼文jsonl輸出到.json檔案，並以小時為單位產生新的.json檔案
 
 ---
 
